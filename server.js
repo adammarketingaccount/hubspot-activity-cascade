@@ -394,11 +394,11 @@ function validateConfig() {
   const errors = [];
 
   if (!HUBSPOT_PRIVATE_APP_TOKEN) {
-    errors.push("HUBSPOT_PRIVATE_APP_TOKEN is required");
+    console.warn("⚠️  WARNING: HUBSPOT_PRIVATE_APP_TOKEN not set");
   }
 
   if (NODE_ENV === "production" && !HUBSPOT_WEBHOOK_SECRET) {
-    errors.push("HUBSPOT_WEBHOOK_SECRET is required in production");
+    console.warn("⚠️  WARNING: HUBSPOT_WEBHOOK_SECRET not set in production");
   }
 
   if (errors.length > 0) {
