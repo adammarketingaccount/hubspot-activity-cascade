@@ -339,12 +339,34 @@ app.post("/webhook", async (req, res) => {
     const results = [];
 
     for (const event of events) {
-      const { objectId, propertyName, eventId, subscriptionId } = event;
+      const { objectId, propertyName, eventId, subscriptionId, subscriptionType, associationType } = event;
 
-      // Only process deal.propertyChange for hs_lastactivitydate
-      if (propertyName !== "hs_lastactivitydate") {
-        console.log(`⏭️  Skipping event: propertyName=${propertyName} (not hs_lastactivitydate)`);
+      // Handle both deal.propertyChange (hs_lastactivitydate) and deal.associationChange
+      const isDealPropertyChange = subscriptionType === "deal.propertyChange" && propertyName === "hs_lastactivitydate";
+      const isDealAssociationChange = subscriptionType === "deal.associationChange";
+
+      if (!isDealPropertyChange && !isDealAssociationChange) {
+        console.log(`⏭️  Skipping event: subscriptionType=${subscriptionType}, propertyName=${propertyName}`);
         continue;
+      }
+
+      // For association changes, we only care about activity associations (notes, calls, emails, etc)
+      if (isDealAssociationChange) {
+        const activityAssociationTypes = [
+          "DEAL_TO_NOTE",
+          "DEAL_TO_CALL", 
+          "DEAL_TO_EMAIL",
+          "DEAL_TO_MEETING",
+          "DEAL_TO_TASK",
+          "DEAL_TO_COMMUNICATION"
+        ];
+        
+        if (!associationType || !activityAssociationTypes.includes(associationType)) {
+          console.log(`⏭️  Skipping non-activity association: ${associationType}`);
+          continue;
+        }
+        
+        console.log(`📌 Activity association detected: ${associationType}`);
       }
 
       if (!objectId) {
