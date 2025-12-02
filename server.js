@@ -45,9 +45,11 @@ function verifyHubSpotSignature(req) {
     return true;
   }
 
-  const signature = req.headers["x-hubspot-signature-v3"] || req.headers["x-hubspot-signature"];
+  const signatureV3 = req.headers["x-hubspot-signature-v3"];
+  const signatureV2 = req.headers["x-hubspot-signature-v2"];
+  const signatureV1 = req.headers["x-hubspot-signature"];
   
-  if (!signature) {
+  if (!signatureV3 && !signatureV2 && !signatureV1) {
     console.error("❌ Missing HubSpot signature header");
     return false;
   }
@@ -58,19 +60,40 @@ function verifyHubSpotSignature(req) {
   }
 
   try {
-    // HubSpot v3 signature verification
-    const sourceString = HUBSPOT_WEBHOOK_SECRET + JSON.stringify(req.body);
-    const hash = crypto.createHash("sha256").update(sourceString).digest("hex");
-    
-    const isValid = hash === signature;
-    
-    if (!isValid) {
-      console.error("❌ Invalid webhook signature");
-      console.debug("Expected:", hash);
-      console.debug("Received:", signature);
+    // Try v3 signature (newest format)
+    if (signatureV3) {
+      const sourceString = HUBSPOT_WEBHOOK_SECRET + req.method + req.originalUrl + JSON.stringify(req.body);
+      const hash = crypto.createHash("sha256").update(sourceString).digest("base64");
+      
+      if (hash === signatureV3) {
+        return true;
+      }
     }
     
-    return isValid;
+    // Try v2 signature
+    if (signatureV2) {
+      const sourceString = HUBSPOT_WEBHOOK_SECRET + JSON.stringify(req.body);
+      const hash = crypto.createHash("sha256").update(sourceString).digest("base64");
+      
+      if (hash === signatureV2) {
+        return true;
+      }
+    }
+    
+    // Try v1 signature (legacy)
+    if (signatureV1) {
+      const sourceString = HUBSPOT_WEBHOOK_SECRET + JSON.stringify(req.body);
+      const hash = crypto.createHash("sha256").update(sourceString).digest("hex");
+      
+      if (hash === signatureV1) {
+        return true;
+      }
+    }
+    
+    console.error("❌ Invalid webhook signature");
+    console.debug("Tried all signature versions");
+    
+    return false;
   } catch (error) {
     console.error("❌ Error verifying signature:", error.message);
     return false;
