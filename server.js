@@ -13,8 +13,17 @@ const LOOKBACK_MS = parseInt(process.env.LOOKBACK_MS || "600000", 10); // 10 min
 const MAX_ACTIVITY_IDS_PER_TYPE = parseInt(process.env.MAX_ACTIVITY_IDS_PER_TYPE || "50", 10);
 const NODE_ENV = process.env.NODE_ENV || "development";
 
-// Includes SMS logged as "communications" in many portals/integrations
-const ACTIVITY_TYPES = ["notes", "calls", "emails", "meetings", "tasks", "communications"];
+// Activity object type IDs (from HubSpot's expanded object support)
+const ACTIVITY_TYPE_IDS = {
+  "0-4": "notes",
+  "0-48": "calls", 
+  "0-49": "emails",
+  "0-47": "meetings",
+  "0-27": "tasks",
+  "0-18": "communications" // SMS, WhatsApp, LinkedIn
+};
+
+const DEAL_TYPE_ID = "0-3";
 
 // Simple in-memory deduplication cache (for production, consider Redis)
 const processedEvents = new Set();
@@ -208,11 +217,17 @@ const associateActivityToProperty = async (activityType, activityId, propertyTyp
 };
 
 // ===== CORE LOGIC =====
-async function processActivityAssociation(dealId, eventId) {
-  console.log(`\n🔄 Processing deal: ${dealId} (event: ${eventId})`);
+async function processActivityForDeal(activityId, dealId, activityType, eventId) {
+  console.log(`\n🔄 Processing activity ${activityId} for deal: ${dealId} (event: ${eventId})`);
   
   const startTime = Date.now();
   const propertyType = await findPropertyObjectType();
+  
+  // Determine activity type from object type ID if not provided
+  if (!activityType) {
+    // Try to fetch the activity to determine its type
+    activityType = "notes"; // Default fallback
+  }
 
   // Get all Properties associated with this deal
   const propertyIds = await listAssociatedIds("deals", dealId, propertyType, 500);
@@ -230,79 +245,49 @@ async function processActivityAssociation(dealId, eventId) {
 
   console.log(`📋 Found ${propertyIds.length} associated Properties`);
 
-  // Get the deal's last activity date to determine time window
-  const lastActivityMs = await safeGetDealLastActivityMs(dealId);
-  const windowStart = (lastActivityMs ?? Date.now()) - LOOKBACK_MS;
-  
-  console.log(`⏰ Looking for activities since: ${new Date(windowStart).toISOString()}`);
-
-  // Pre-fetch associationTypeId for each activity type -> property type
-  const assocTypeIdByActivityType = {};
-  for (const t of ACTIVITY_TYPES) {
-    try {
-      assocTypeIdByActivityType[t] = await getAssociationTypeId(t, propertyType);
-    } catch (e) {
-      // If your portal doesn't support a given activity object type, skip it
-      console.warn(`⚠️  Could not get association type for ${t}: ${e.message}`);
-      assocTypeIdByActivityType[t] = null;
-    }
+  // Get association type ID for this activity type to properties
+  let assocTypeId;
+  try {
+    assocTypeId = await getAssociationTypeId(activityType, propertyType);
+  } catch (e) {
+    console.error(`❌ Could not get association type for ${activityType} → ${propertyType}: ${e.message}`);
+    return {
+      activityId: String(activityId),
+      dealId: String(dealId),
+      propertyCount: propertyIds.length,
+      associationsAttempted: 0,
+      reason: `Association type not found for ${activityType}`,
+    };
   }
 
   let totalAssociationsCreated = 0;
-  const pickedActivities = [];
 
-  for (const activityType of ACTIVITY_TYPES) {
-    const assocTypeId = assocTypeIdByActivityType[activityType];
-    if (!assocTypeId) continue;
-
-    // Pull a slice of most recently-associated IDs we can see
-    const activityIds = await listAssociatedIds("deals", dealId, activityType, MAX_ACTIVITY_IDS_PER_TYPE);
-    if (!activityIds.length) continue;
-
-    console.log(`  📝 Checking ${activityIds.length} ${activityType}...`);
-
-    const records = await batchReadActivities(activityType, activityIds);
-
-    // Keep activities in our time window
-    const recent = records.filter((r) => {
-      const p = r.properties || {};
-      const t =
-        parseHsDateMs(p.hs_timestamp) ||
-        parseHsDateMs(p.hs_createdate) ||
-        parseHsDateMs(p.hs_lastmodifieddate);
-
-      return t !== null && t >= windowStart;
-    });
-
-    console.log(`  ✅ Found ${recent.length} recent ${activityType} in time window`);
-
-    for (const r of recent) {
-      pickedActivities.push({ type: activityType, id: String(r.id) });
-
-      for (const propId of propertyIds) {
-        try {
-          await associateActivityToProperty(activityType, r.id, propertyType, propId, assocTypeId);
-          totalAssociationsCreated += 1;
-        } catch (err) {
-          // If it already exists, HubSpot may error with 409; ignore duplicates
-          const status = err?.response?.status;
-          if (status === 409) {
-            continue; // Already associated, this is fine (idempotent)
-          }
-          // Log other errors but don't fail the entire operation
-          console.error(`  ❌ Error associating ${activityType} ${r.id} to Property ${propId}:`, err.message);
-        }
+  // Associate this specific activity with all properties
+  for (const propId of propertyIds) {
+    try {
+      await associateActivityToProperty(activityType, activityId, propertyType, propId, assocTypeId);
+      totalAssociationsCreated += 1;
+      console.log(`  ✅ Associated ${activityType} ${activityId} → Property ${propId}`);
+    } catch (err) {
+      // If it already exists, HubSpot may error with 409; ignore duplicates
+      const status = err?.response?.status;
+      if (status === 409) {
+        console.log(`  ⏭️  Already associated: ${activityType} ${activityId} → Property ${propId}`);
+        continue; // Already associated, this is fine (idempotent)
       }
+      // Log other errors but don't fail the entire operation
+      console.error(`  ❌ Error associating ${activityType} ${activityId} to Property ${propId}:`, err.message);
     }
   }
 
   const duration = Date.now() - startTime;
   
   const result = {
+    activityId: String(activityId),
+    activityType,
     dealId: String(dealId),
     propertyCount: propertyIds.length,
-    activitiesConsidered: pickedActivities.length,
-    associationsAttempted: totalAssociationsCreated,
+    associationsCreated: totalAssociationsCreated,
     durationMs: duration,
   };
 
@@ -339,43 +324,66 @@ app.post("/webhook", async (req, res) => {
     const results = [];
 
     for (const event of events) {
-      const { objectId, propertyName, eventId, subscriptionId, subscriptionType, associationType } = event;
+      const { 
+        objectId, 
+        eventId, 
+        subscriptionId, 
+        subscriptionType,
+        fromObjectId,
+        toObjectId,
+        fromObjectTypeId,
+        toObjectTypeId,
+        associationRemoved
+      } = event;
 
-      // Handle both deal.propertyChange (hs_lastactivitydate) and deal.associationChange
-      const isDealPropertyChange = subscriptionType === "deal.propertyChange" && propertyName === "hs_lastactivitydate";
-      const isDealAssociationChange = subscriptionType === "deal.associationChange";
+      // Handle activity creation and association events
+      const isActivityCreation = subscriptionType === "object.creation";
+      const isActivityAssociation = subscriptionType === "object.associationChange";
 
-      if (!isDealPropertyChange && !isDealAssociationChange) {
-        console.log(`⏭️  Skipping event: subscriptionType=${subscriptionType}, propertyName=${propertyName}`);
+      if (!isActivityCreation && !isActivityAssociation) {
+        console.log(`⏭️  Skipping event: subscriptionType=${subscriptionType}`);
         continue;
       }
 
-      // For association changes, we only care about activity associations (notes, calls, emails, etc)
-      if (isDealAssociationChange) {
-        const activityAssociationTypes = [
-          "DEAL_TO_NOTE",
-          "DEAL_TO_CALL", 
-          "DEAL_TO_EMAIL",
-          "DEAL_TO_MEETING",
-          "DEAL_TO_TASK",
-          "DEAL_TO_COMMUNICATION"
-        ];
+      let activityId = null;
+      let dealId = null;
+      let activityType = null;
+
+      if (isActivityCreation) {
+        // For creation events, we need to check if this activity is associated with any deals
+        activityId = objectId;
+        console.log(`📝 Activity created: ${activityId}`);
+        // We'll process this by fetching all deals associated with this activity
         
-        if (!associationType || !activityAssociationTypes.includes(associationType)) {
-          console.log(`⏭️  Skipping non-activity association: ${associationType}`);
+      } else if (isActivityAssociation) {
+        // Skip if association was removed
+        if (associationRemoved) {
+          console.log(`⏭️  Skipping: association removed`);
           continue;
         }
-        
-        console.log(`📌 Activity association detected: ${associationType}`);
+
+        // Determine if this is an activity-to-deal association
+        const isActivityType = ACTIVITY_TYPE_IDS[fromObjectTypeId];
+        const isDealType = toObjectTypeId === DEAL_TYPE_ID;
+
+        if (isActivityType && isDealType) {
+          activityId = fromObjectId;
+          dealId = toObjectId;
+          activityType = ACTIVITY_TYPE_IDS[fromObjectTypeId];
+          console.log(`📌 Activity associated with deal: ${activityType} ${activityId} → Deal ${dealId}`);
+        } else {
+          console.log(`⏭️  Skipping: not activity-to-deal association (${fromObjectTypeId} → ${toObjectTypeId})`);
+          continue;
+        }
       }
 
-      if (!objectId) {
-        console.error("❌ Event missing objectId:", event);
+      if (!activityId) {
+        console.error("❌ Could not determine activity ID from event:", event);
         continue;
       }
 
       // Deduplication: Skip if we've already processed this event
-      const dedupeKey = `${eventId || objectId}-${subscriptionId}`;
+      const dedupeKey = `${eventId || activityId}-${subscriptionId}-${dealId || 'creation'}`;
       if (processedEvents.has(dedupeKey)) {
         console.log(`⏭️  Skipping duplicate event: ${dedupeKey}`);
         continue;
@@ -392,17 +400,31 @@ app.post("/webhook", async (req, res) => {
       }
 
       try {
-        // Small delay to ensure HubSpot has fully saved the activity
+        // Small delay to ensure HubSpot has fully saved the associations
         await new Promise(resolve => setTimeout(resolve, 1500));
         
-        const result = await processActivityAssociation(objectId, eventId);
-        results.push(result);
+        // If we have a dealId, process just that deal
+        // If not (creation event), fetch all deals associated with the activity
+        if (dealId) {
+          const result = await processActivityForDeal(activityId, dealId, activityType, eventId);
+          results.push(result);
+        } else {
+          // For creation events, find all associated deals and process each
+          const dealIds = await listAssociatedIds(activityType || "notes", activityId, "deals", 100);
+          console.log(`🔍 Activity ${activityId} associated with ${dealIds.length} deals`);
+          
+          for (const dId of dealIds) {
+            const result = await processActivityForDeal(activityId, dId, activityType, eventId);
+            results.push(result);
+          }
+        }
       } catch (error) {
-        console.error(`❌ Error processing deal ${objectId}:`, error.message);
+        console.error(`❌ Error processing activity ${activityId}:`, error.message);
         console.error(error.stack);
         
         results.push({
-          dealId: objectId,
+          activityId,
+          dealId,
           error: error.message,
           success: false,
         });
