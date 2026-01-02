@@ -6,6 +6,7 @@
   "scripts": {
     "start": "node server.js",
     "dev": "NODE_ENV=development nodemon server.js",
+    "sync": "node test-batch-sync.js",
     "test": "echo \"No tests yet\" && exit 0"
   },
   "keywords": [

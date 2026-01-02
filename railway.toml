@@ -1,0 +1,16 @@
+[build]
+builder = "NIXPACKS"
+
+[deploy]
+startCommand = "npm start"
+healthcheckPath = "/health"
+healthcheckTimeout = 100
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
+
+# Cron job to sync Note→Portfolio associations every 20 minutes
+# The script internally decides whether to run based on time of day
+[[crons]]
+name = "sync-note-portfolio-associations"
+schedule = "*/20 * * * *"
+command = "npm run sync"
