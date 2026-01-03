@@ -857,16 +857,6 @@ async function createBatchAssociations(associations, associationTypeId) {
   return 0;
 }
 
-async function getAssociationTypeId(fromObjectType, toObjectType) {
-  try {
-    const response = await hs.get(`/crm/v4/associations/${fromObjectType}/${toObjectType}/labels`);
-    const userDefined = response.data.results.find(r => r.category === "USER_DEFINED");
-    return userDefined?.typeId || 1;
-  } catch (error) {
-    return 1;
-  }
-}
-
 async function processNoteBatch(notes, associationTypeId) {
   const noteIds = notes.map(n => n.id);
   
