@@ -1,27 +1,48 @@
 # HubSpot Activity Association Service
 
-Automatically associates deal activities (notes, calls, emails, SMS) to related Property custom objects in HubSpot.
+Automatically cascades activities (notes, calls, emails, meetings, tasks, communications) through your HubSpot object hierarchy: Contact → Deal → Property → Portfolio.
 
 ## 🎯 Purpose
 
-When activities are logged to contacts and cascade to deals via HubSpot's native settings, they **do not** automatically cascade to the deal's associated custom objects (Properties). This service bridges that gap by:
+When activities are logged in HubSpot, they **do not** automatically cascade to custom objects (Properties, Portfolios). This service provides complete activity cascade coverage through a **dual-architecture approach**:
 
-1. Listening for webhook events when activities are added to deals
-2. Fetching all Properties associated with the deal
-3. Creating associations between the activities and all related Properties
+### Webhook-Based Cascade (Real-time)
+When activities are added to Deals, immediately cascade them to associated Properties.
+
+### Polling-Based Cascade (Every 20 minutes)
+Scan all activities and ensure they're associated with:
+- **Portfolios** (via Property associations)
+- **Deals** (via Property associations)
+
+This handles the common workflow where users associate activities directly with Properties (bypassing Deals), ensuring those activities still appear on related Deals and Portfolios.
 
 ## 🏗️ Architecture
 
 ```
-Activity Added to Deal
-    ↓
-hs_lastactivitydate changes
-    ↓
-HubSpot Webhook → Railway Server
-    ↓
-Fetch associated Properties
-    ↓
-Associate activities to Properties
+┌─────────────────────────────────────────────────────┐
+│ WEBHOOK-BASED (Real-time)                          │
+├─────────────────────────────────────────────────────┤
+│ Activity → Deal                                     │
+│       ↓                                             │
+│ Webhook fires (hs_lastactivitydate)                │
+│       ↓                                             │
+│ Fetch Deal's Properties                            │
+│       ↓                                             │
+│ Create Activity → Property associations            │
+└─────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────┐
+│ POLLING-BASED (Every 20 minutes)                   │
+├─────────────────────────────────────────────────────┤
+│ Fetch ALL activities (notes, calls, emails, etc.)  │
+│       ↓                                             │
+│ For each activity with Property associations:      │
+│   • Find Property's Portfolios → Create Activity→Portfolio
+│   • Find Property's Deals → Create Activity→Deal   │
+│       ↓                                             │
+│ Batch process with 3 concurrent batches            │
+│ Performance: ~268 activities/sec                   │
+└─────────────────────────────────────────────────────┘
 ```
 
 ## 🚀 Quick Start
@@ -65,9 +86,12 @@ See [SETUP.md](./SETUP.md) for complete deployment instructions.
 |----------|----------|-------------|
 | `HUBSPOT_PRIVATE_APP_TOKEN` | Yes | Private app access token from HubSpot |
 | `HUBSPOT_WEBHOOK_SECRET` | Yes (prod) | Webhook secret for signature verification |
+| `PROPERTY_OBJECT_TYPE_ID` | Yes | Property custom object type ID (e.g., "2-160536042") |
+| `PORTFOLIO_OBJECT_TYPE_ID` | Yes | Portfolio custom object type ID (e.g., "2-237039158") |
 | `PROPERTY_OBJECT_PLURAL_LABEL` | No | Custom object plural label (default: "Properties") |
 | `LOOKBACK_MS` | No | Time window for activities in ms (default: 600000 = 10 min) |
 | `MAX_ACTIVITY_IDS_PER_TYPE` | No | Max activities to fetch per type (default: 50) |
+| `NOTE_PORTFOLIO_SYNC_INTERVAL_MINUTES` | No | Polling interval (default: 20) |
 | `PORT` | No | Server port (default: 3000, Railway sets automatically) |
 | `NODE_ENV` | No | Environment mode (default: development) |
 
@@ -122,14 +146,24 @@ Receives HubSpot webhook events.
 
 ## 🔧 Features
 
-- ✅ **Webhook-driven**: Responds immediately when activities are added
-- ✅ **Idempotent**: Safe to run multiple times, won't create duplicates
+### Webhook-Based (Real-time)
+- ✅ **Immediate response**: Triggers within seconds of activity creation
+- ✅ **Deal → Property cascade**: Activities on Deals automatically appear on Properties
 - ✅ **Signature verification**: Validates webhook authenticity
 - ✅ **Deduplication**: Prevents processing the same event twice
-- ✅ **Multiple activity types**: Handles notes, calls, emails, meetings, tasks, SMS
-- ✅ **Time-window filtering**: Only processes recent activities
-- ✅ **Error handling**: Gracefully handles API failures
-- ✅ **Logging**: Detailed console logging for debugging
+
+### Polling-Based (Every 20 minutes)
+- ✅ **Property → Portfolio cascade**: Activities on Properties appear on Portfolios
+- ✅ **Property → Deal cascade**: Activities on Properties appear on Deals
+- ✅ **All activity types**: notes, calls, emails, meetings, tasks, communications
+- ✅ **Batch processing**: Processes 100 activities per batch with 3 concurrent batches
+- ✅ **Performance**: ~268 activities/second average
+- ✅ **Idempotent**: Safe to run multiple times, won't create duplicates
+
+### General
+- ✅ **Zero maintenance**: Runs continuously with retry logic and error handling
+- ✅ **Time-window filtering**: Only processes recent activities (webhook mode)
+- ✅ **Detailed logging**: Emoji indicators and performance metrics
 
 ## 🛠️ Technology Stack
 
@@ -141,35 +175,96 @@ Receives HubSpot webhook events.
 
 ## 📊 Monitoring
 
-- Health check endpoint: `/health`
-- Console logs with emoji indicators for easy scanning
-- Process duration tracking
-- Error logging with stack traces
+- **Health check endpoint**: `/health`
+- **Webhook processing**: Real-time logs with deal IDs and property counts
+- **Batch sync metrics**: Activities processed, associations created, duration
+- **Console logs**: Emoji indicators for easy scanning (🔄 processing, ✅ success, ❌ error)
+- **Performance tracking**: ~268 activities/second average throughput
+
+## 🔍 How It Works
+
+### Webhook Flow (Deal → Property)
+1. Activity is associated with a Deal in HubSpot
+2. `hs_lastactivitydate` changes, triggering webhook
+3. Server receives webhook, validates signature
+4. Fetches all recent activities for the Deal
+5. Fetches all Properties associated with the Deal
+6. Creates associations between activities and Properties
+
+### Polling Flow (Property → Portfolio + Deal)
+1. Every 20 minutes, fetch all activities of each type (notes, calls, emails, meetings, tasks, communications)
+2. For each activity with Property associations:
+   - Check which Portfolios those Properties belong to
+   - Check which Deals those Properties belong to
+   - Create missing Activity → Portfolio associations
+   - Create missing Activity → Deal associations
+3. Process in batches of 100 with 3 concurrent batches
+4. Use HubSpot batch APIs to minimize API calls (100 associations per call)
 
 ## 🐛 Troubleshooting
 
-### Webhook not receiving events
+### Webhook Issues
+
+**Webhook not receiving events**
 - Verify webhook URL in HubSpot matches your Railway deployment URL
 - Check webhook subscription is active
 - Verify `HUBSPOT_WEBHOOK_SECRET` matches HubSpot
 
-### Invalid signature errors
+**Invalid signature errors**
 - Ensure `HUBSPOT_WEBHOOK_SECRET` is correct
 - Check that webhook v3 signatures are enabled in HubSpot
 
-### No activities found
-- Verify `LOOKBACK_MS` is long enough
+**No activities found**
+- Verify `LOOKBACK_MS` is long enough (default: 10 minutes)
 - Check that activities are actually associated with the deal
-- Increase the delay in the webhook handler (currently 1.5s)
+- Increase the delay in the webhook handler if needed
 
-### Wrong custom object type
+### Polling Issues
+
+**Associations not being created**
+- Check Railway logs for errors during batch sync
+- Verify `PROPERTY_OBJECT_TYPE_ID` and `PORTFOLIO_OBJECT_TYPE_ID` are correct
+- Ensure activities have Property associations to cascade from
+- Check HubSpot API rate limits aren't being exceeded
+
+**Performance issues**
+- Default processes ~268 activities/second
+- Adjust `MAX_CONCURRENT_BATCHES` if hitting rate limits (currently 3)
+- Monitor sync duration in logs (should complete in 5-10 minutes for all activity types)
+
+### General
+
+**Wrong custom object type**
 - Verify `PROPERTY_OBJECT_PLURAL_LABEL` exactly matches HubSpot settings
-- Check custom object is properly configured
+- Check custom object IDs are correct (found in HubSpot object settings)
+
+**Association type errors**
+- Ensure proper association labels exist between activity types and custom objects
+- System automatically detects HUBSPOT_DEFINED vs USER_DEFINED categories
 
 ## 📚 Documentation
 
 - [GAMEPLAN.md](./GAMEPLAN.md) - Complete migration plan and architecture
-- [SETUP.md](./SETUP.md) - Step-by-step deployment guide (coming soon)
+
+## 💡 Why Two Systems?
+
+**Webhooks** are ideal for Deal → Property cascade because:
+- HubSpot fires webhooks when activities are added to Deals
+- Real-time response (< 2 seconds)
+- Minimal API usage
+
+**Polling** is required for Property → Portfolio/Deal cascade because:
+- HubSpot doesn't fire webhooks for activity → custom object associations
+- Tested extensively (30+ audit log queries) - confirmed webhooks don't fire
+- Handles the workflow where users associate activities directly with Properties
+- Ensures comprehensive coverage across all object types
+
+## 🎯 Use Cases
+
+1. **Deal-centric workflow**: Activity added to Deal → appears on Properties → appears on Portfolio
+2. **Property-centric workflow**: Activity added to Property → appears on Portfolio AND Deal
+3. **Retroactive sync**: Existing activities are processed every 20 minutes
+4. **Multi-object visibility**: One activity appears on Contact, Deal, Property, and Portfolio
 
 ## 📄 License
 

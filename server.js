@@ -217,7 +217,7 @@ const getAssociationTypeId = async (fromType, toType) => {
 
   // Prefer HUBSPOT_DEFINED if present
   const preferred = labels.find((l) => l.category === "HUBSPOT_DEFINED") || labels[0];
-  return preferred.typeId;
+  return { typeId: preferred.typeId, category: preferred.category };
 };
 
 const safeGetDealLastActivityMs = async (dealId) => {
@@ -281,6 +281,7 @@ async function processActivityForDeal(activityId, dealId, activityType, eventId)
   let assocTypeId;
   try {
     assocTypeId = await getAssociationTypeId(activityType, propertyType);
+    assocTypeId = assocTypeId.typeId;
   } catch (e) {
     console.error(`❌ Could not get association type for ${activityType} → ${propertyType}: ${e.message}`);
     return {
@@ -362,6 +363,7 @@ async function processActivityForProperty(activityId, propertyId, activityType, 
   let assocTypeId;
   try {
     assocTypeId = await getAssociationTypeId(activityType, portfolioObjectName);
+    assocTypeId = assocTypeId.typeId;
   } catch (e) {
     console.error(`❌ Could not get association type for ${activityType} → ${portfolioObjectName}: ${e.message}`);
     return {
@@ -764,16 +766,15 @@ validateConfig();
 
 // ===== NOTE→PORTFOLIO BATCH SYNC =====
 
-async function fetchNotesBatch(after = null) {
-  const response = await hs.get('/crm/v3/objects/notes', {
+async function fetchActivitiesBatch(activityType, after = null) {
+  const response = await hs.get(`/crm/v3/objects/${activityType}`, {
     params: {
       limit: BATCH_SIZE,
-      properties: 'hs_note_body',
       after
     }
   });
   return {
-    notes: response.data.results || [],
+    activities: response.data.results || [],
     after: response.data.paging?.next?.after || null
   };
 }
@@ -824,7 +825,7 @@ async function getBatchAssociations(objectType, objectIds, toObjectType) {
   return new Map();
 }
 
-async function createBatchAssociations(associations, associationTypeId) {
+async function createBatchAssociations(activityType, toObjectType, associations, associationTypeId, associationCategory) {
   if (associations.length === 0) return 0;
 
   const maxRetries = 5;
@@ -835,11 +836,11 @@ async function createBatchAssociations(associations, associationTypeId) {
       const inputs = associations.map(({ fromId, toId }) => ({
         from: { id: fromId },
         to: { id: toId },
-        types: [{ associationCategory: "USER_DEFINED", associationTypeId }]
+        types: [{ associationCategory, associationTypeId }]
       }));
       
       const response = await hs.post(
-        `/crm/v4/associations/notes/${portfolioObjectName}/batch/create`,
+        `/crm/v4/associations/${activityType}/${toObjectType}/batch/create`,
         { inputs }
       );
       
@@ -857,14 +858,15 @@ async function createBatchAssociations(associations, associationTypeId) {
   return 0;
 }
 
-async function processNoteBatch(notes, associationTypeId) {
-  const noteIds = notes.map(n => n.id);
+async function processActivityBatch(activityType, activities, portfolioAssocType, dealAssocType) {
+  const activityIds = activities.map(a => a.id);
   
-  const notePropertyMap = await getBatchAssociations('notes', noteIds, propertyObjectName);
-  const notePortfolioMap = await getBatchAssociations('notes', noteIds, portfolioObjectName);
+  const activityPropertyMap = await getBatchAssociations(activityType, activityIds, propertyObjectName);
+  const activityPortfolioMap = await getBatchAssociations(activityType, activityIds, portfolioObjectName);
+  const activityDealMap = await getBatchAssociations(activityType, activityIds, 'deals');
   
   const allPropertyIds = new Set();
-  for (const propertyIds of notePropertyMap.values()) {
+  for (const propertyIds of activityPropertyMap.values()) {
     propertyIds.forEach(id => allPropertyIds.add(id));
   }
   
@@ -873,76 +875,113 @@ async function processNoteBatch(notes, associationTypeId) {
     Array.from(allPropertyIds), 
     portfolioObjectName
   );
+  const propertyDealMap = await getBatchAssociations(
+    propertyObjectName,
+    Array.from(allPropertyIds),
+    'deals'
+  );
   
-  const allMissingAssociations = [];
+  const missingPortfolioAssociations = [];
+  const missingDealAssociations = [];
   
-  for (const note of notes) {
-    const noteId = note.id;
-    const propertyIds = notePropertyMap.get(noteId) || [];
+  for (const activity of activities) {
+    const activityId = activity.id;
+    const propertyIds = activityPropertyMap.get(activityId) || [];
     
     if (propertyIds.length === 0) continue;
     
-    const currentPortfolioIds = notePortfolioMap.get(noteId) || [];
+    const currentPortfolioIds = activityPortfolioMap.get(activityId) || [];
     const currentPortfolioSet = new Set(currentPortfolioIds);
+    const currentDealIds = activityDealMap.get(activityId) || [];
+    const currentDealSet = new Set(currentDealIds);
     
     const expectedPortfolioIds = new Set();
+    const expectedDealIds = new Set();
     for (const propertyId of propertyIds) {
       const portfolioIds = propertyPortfolioMap.get(propertyId) || [];
       portfolioIds.forEach(id => expectedPortfolioIds.add(id));
+      const dealIds = propertyDealMap.get(propertyId) || [];
+      dealIds.forEach(id => expectedDealIds.add(id));
     }
     
     const missingPortfolioIds = Array.from(expectedPortfolioIds).filter(
       id => !currentPortfolioSet.has(id)
     );
+    const missingDealIds = Array.from(expectedDealIds).filter(
+      id => !currentDealSet.has(id)
+    );
     
     for (const portfolioId of missingPortfolioIds) {
-      allMissingAssociations.push({ fromId: noteId, toId: portfolioId });
+      missingPortfolioAssociations.push({ fromId: activityId, toId: portfolioId });
+    }
+    for (const dealId of missingDealIds) {
+      missingDealAssociations.push({ fromId: activityId, toId: dealId });
     }
   }
   
-  if (allMissingAssociations.length > 0) {
-    return await createBatchAssociations(allMissingAssociations, associationTypeId);
+  let totalCreated = 0;
+  if (missingPortfolioAssociations.length > 0) {
+    totalCreated += await createBatchAssociations(activityType, portfolioObjectName, missingPortfolioAssociations, portfolioAssocType.typeId, portfolioAssocType.category);
+  }
+  if (missingDealAssociations.length > 0) {
+    totalCreated += await createBatchAssociations(activityType, 'deals', missingDealAssociations, dealAssocType.typeId, dealAssocType.category);
   }
   
-  return 0;
+  return totalCreated;
 }
 
-async function syncNotePortfolioAssociations() {
+async function syncActivityPortfolioAssociations() {
   const startTime = Date.now();
-  console.log('\n🔄 Starting Note→Portfolio batch sync...');
+  console.log('\n🔄 Starting Activity→Portfolio batch sync...');
   
-  try {
-    let allBatches = [];
-    let after = null;
-    
-    while (true) {
-      const { notes, after: nextAfter } = await fetchNotesBatch(after);
-      if (notes.length === 0) break;
-      allBatches.push(notes);
-      after = nextAfter;
-      if (!nextAfter) break;
-    }
-    
-    console.log(`   Fetched ${allBatches.length} batches (${allBatches.reduce((sum, b) => sum + b.length, 0)} notes)`);
-    
-    const associationTypeId = await getAssociationTypeId('notes', portfolioObjectName);
-    let totalCreated = 0;
-    
-    for (let i = 0; i < allBatches.length; i += MAX_CONCURRENT_BATCHES) {
-      const concurrentBatches = allBatches.slice(i, i + MAX_CONCURRENT_BATCHES);
+  const activityTypes = ['notes', 'calls', 'emails', 'meetings', 'tasks', 'communications'];
+  let grandTotalCreated = 0;
+  
+  for (const activityType of activityTypes) {
+    try {
+      console.log(`\n   📝 Processing ${activityType}...`);
+      let allBatches = [];
+      let after = null;
       
-      const results = await Promise.all(
-        concurrentBatches.map(batch => processNoteBatch(batch, associationTypeId))
-      );
+      while (true) {
+        const { activities, after: nextAfter } = await fetchActivitiesBatch(activityType, after);
+        if (activities.length === 0) break;
+        allBatches.push(activities);
+        after = nextAfter;
+        if (!nextAfter) break;
+      }
       
-      totalCreated += results.reduce((sum, r) => sum + r, 0);
+      if (allBatches.length === 0) {
+        console.log(`      No ${activityType} found, skipping...`);
+        continue;
+      }
+      
+      const totalActivities = allBatches.reduce((sum, b) => sum + b.length, 0);
+      console.log(`      Fetched ${allBatches.length} batches (${totalActivities} ${activityType})`);
+      
+      const portfolioAssocType = await getAssociationTypeId(activityType, portfolioObjectName);
+      const dealAssocType = await getAssociationTypeId(activityType, 'deals');
+      let typeCreated = 0;
+      
+      for (let i = 0; i < allBatches.length; i += MAX_CONCURRENT_BATCHES) {
+        const concurrentBatches = allBatches.slice(i, i + MAX_CONCURRENT_BATCHES);
+        
+        const results = await Promise.all(
+          concurrentBatches.map(batch => processActivityBatch(activityType, batch, portfolioAssocType, dealAssocType))
+        );
+        
+        typeCreated += results.reduce((sum, r) => sum + r, 0);
+      }
+      
+      grandTotalCreated += typeCreated;
+      console.log(`      ✅ ${activityType}: ${typeCreated} associations created`);
+    } catch (error) {
+      console.error(`      ❌ ${activityType} failed:`, error.message);
     }
-    
-    const totalTime = ((Date.now() - startTime) / 1000).toFixed(1);
-    console.log(`   ✅ Sync complete: ${totalCreated} associations created in ${totalTime}s\n`);
-  } catch (error) {
-    console.error(`   ❌ Sync failed:`, error.message);
   }
+  
+  const totalTime = ((Date.now() - startTime) / 1000).toFixed(1);
+  console.log(`\n   ✅ All activities complete: ${grandTotalCreated} total associations created in ${totalTime}s\n`);
 }
 
 // ===== SERVER STARTUP =====
@@ -981,18 +1020,18 @@ async function syncNotePortfolioAssociations() {
       });
     }, POLLING_INTERVAL_MINUTES * 60 * 1000);
     
-    // Start Note→Portfolio batch sync
-    console.log(`🔄 Starting Note→Portfolio sync (every ${NOTE_PORTFOLIO_SYNC_INTERVAL_MINUTES} minutes)...\n`);
+    // Start Activity→Portfolio batch sync
+    console.log(`🔄 Starting Activity→Portfolio sync (every ${NOTE_PORTFOLIO_SYNC_INTERVAL_MINUTES} minutes)...\n`);
     
     // Run immediately on startup
-    syncNotePortfolioAssociations().catch(err => {
-      console.error("❌ Initial Note→Portfolio sync failed:", err.message);
+    syncActivityPortfolioAssociations().catch(err => {
+      console.error("❌ Initial Activity→Portfolio sync failed:", err.message);
     });
     
     // Then run on interval
     setInterval(() => {
-      syncNotePortfolioAssociations().catch(err => {
-        console.error("❌ Note→Portfolio sync failed:", err.message);
+      syncActivityPortfolioAssociations().catch(err => {
+        console.error("❌ Activity→Portfolio sync failed:", err.message);
       });
     }, NOTE_PORTFOLIO_SYNC_INTERVAL_MINUTES * 60 * 1000);
   });
