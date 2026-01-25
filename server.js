@@ -29,10 +29,12 @@ const ACTIVITY_TYPE_IDS = {
 };
 
 const DEAL_TYPE_ID = "0-3";
+const COMPANY_OBJECT_TYPE = "companies";
 
 // Store the fullyQualifiedNames for custom objects (fetched at startup)
 let propertyObjectName = null;
 let portfolioObjectName = null;
+let noteCompanyAssociationType = null;
 
 // Note→Portfolio sync configuration
 const NOTE_PORTFOLIO_SYNC_INTERVAL_MINUTES = parseInt(process.env.NOTE_PORTFOLIO_SYNC_INTERVAL_MINUTES || "20", 10);
@@ -220,6 +222,15 @@ const getAssociationTypeId = async (fromType, toType) => {
   return { typeId: preferred.typeId, category: preferred.category };
 };
 
+const getNoteCompanyAssociationType = async () => {
+  if (noteCompanyAssociationType) {
+    return noteCompanyAssociationType;
+  }
+
+  noteCompanyAssociationType = await getAssociationTypeId("notes", COMPANY_OBJECT_TYPE);
+  return noteCompanyAssociationType;
+};
+
 const safeGetDealLastActivityMs = async (dealId) => {
   const res = await hs.get(`/crm/v3/objects/deals/${dealId}`, {
     params: { properties: "hs_lastactivitydate" },
@@ -343,55 +354,105 @@ async function processActivityForProperty(activityId, propertyId, activityType, 
   if (!activityType) {
     activityType = "notes"; // Default fallback
   }
+  const isNote = activityType === "notes";
 
   // Get all Portfolios associated with this Property
   const portfolioIds = await listAssociatedIds(propertyObjectName, propertyId, portfolioObjectName, 500);
   
   if (!portfolioIds.length) {
-    console.log(`⚠️  No associated Portfolios found for property ${propertyId}. Skipping.`);
-    return {
-      propertyId: String(propertyId),
-      portfolioCount: 0,
-      associationsAttempted: 0,
-      reason: "No associated Portfolios found on property.",
-    };
+    console.log(`⚠️  No associated Portfolios found for property ${propertyId}.`);
+    if (!isNote) {
+      return {
+        propertyId: String(propertyId),
+        portfolioCount: 0,
+        associationsAttempted: 0,
+        reason: "No associated Portfolios found on property.",
+      };
+    }
+  } else {
+    console.log(`📋 Found ${portfolioIds.length} associated Portfolios`);
   }
 
-  console.log(`📋 Found ${portfolioIds.length} associated Portfolios`);
-
   // Get association type ID for this activity type to portfolios
-  let assocTypeId;
-  try {
-    assocTypeId = await getAssociationTypeId(activityType, portfolioObjectName);
-    assocTypeId = assocTypeId.typeId;
-  } catch (e) {
-    console.error(`❌ Could not get association type for ${activityType} → ${portfolioObjectName}: ${e.message}`);
-    return {
-      activityId: String(activityId),
-      propertyId: String(propertyId),
-      portfolioCount: portfolioIds.length,
-      associationsAttempted: 0,
-      reason: `Association type not found for ${activityType}`,
-    };
+  let assocTypeId = null;
+  if (portfolioIds.length) {
+    try {
+      assocTypeId = await getAssociationTypeId(activityType, portfolioObjectName);
+      assocTypeId = assocTypeId.typeId;
+    } catch (e) {
+      console.error(`❌ Could not get association type for ${activityType} → ${portfolioObjectName}: ${e.message}`);
+      if (!isNote) {
+        return {
+          activityId: String(activityId),
+          propertyId: String(propertyId),
+          portfolioCount: portfolioIds.length,
+          associationsAttempted: 0,
+          reason: `Association type not found for ${activityType}`,
+        };
+      }
+    }
   }
 
   let totalAssociationsCreated = 0;
 
   // Associate this specific activity with all portfolios
-  for (const portfolioId of portfolioIds) {
-    try {
-      await associateActivityToProperty(activityType, activityId, portfolioObjectName, portfolioId, assocTypeId);
-      totalAssociationsCreated += 1;
-      console.log(`  ✅ Associated ${activityType} ${activityId} → Portfolio ${portfolioId}`);
-    } catch (err) {
-      // If it already exists, HubSpot may error with 409; ignore duplicates
-      const status = err?.response?.status;
-      if (status === 409) {
-        console.log(`  ⏭️  Already associated: ${activityType} ${activityId} → Portfolio ${portfolioId}`);
-        continue; // Already associated, this is fine (idempotent)
+  if (assocTypeId) {
+    for (const portfolioId of portfolioIds) {
+      try {
+        await associateActivityToProperty(activityType, activityId, portfolioObjectName, portfolioId, assocTypeId);
+        totalAssociationsCreated += 1;
+        console.log(`  ✅ Associated ${activityType} ${activityId} → Portfolio ${portfolioId}`);
+      } catch (err) {
+        // If it already exists, HubSpot may error with 409; ignore duplicates
+        const status = err?.response?.status;
+        if (status === 409) {
+          console.log(`  ⏭️  Already associated: ${activityType} ${activityId} → Portfolio ${portfolioId}`);
+          continue; // Already associated, this is fine (idempotent)
+        }
+        // Log other errors but don't fail the entire operation
+        console.error(`  ❌ Error associating ${activityType} ${activityId} to Portfolio ${portfolioId}:`, err.message);
       }
-      // Log other errors but don't fail the entire operation
-      console.error(`  ❌ Error associating ${activityType} ${activityId} to Portfolio ${portfolioId}:`, err.message);
+    }
+  }
+
+  let companyIds = [];
+  let companyAssociationsCreated = 0;
+
+  if (isNote) {
+    try {
+      companyIds = await listAssociatedIds(propertyObjectName, propertyId, COMPANY_OBJECT_TYPE, 500);
+
+      if (companyIds.length) {
+        console.log(`📋 Found ${companyIds.length} associated Companies`);
+
+        let noteCompanyAssocType = null;
+        try {
+          noteCompanyAssocType = await getNoteCompanyAssociationType();
+        } catch (e) {
+          console.error(`❌ Could not get association type for notes → companies: ${e.message}`);
+        }
+
+        if (noteCompanyAssocType) {
+          for (const companyId of companyIds) {
+            try {
+              await associateActivityToProperty("notes", activityId, COMPANY_OBJECT_TYPE, companyId, noteCompanyAssocType.typeId);
+              companyAssociationsCreated += 1;
+              console.log(`  ✅ Associated notes ${activityId} → Company ${companyId}`);
+            } catch (err) {
+              const status = err?.response?.status;
+              if (status === 409) {
+                console.log(`  ⏭️  Already associated: notes ${activityId} → Company ${companyId}`);
+                continue;
+              }
+              console.error(`  ❌ Error associating notes ${activityId} to Company ${companyId}:`, err.message);
+            }
+          }
+        }
+      } else {
+        console.log(`⚠️  No associated Companies found for property ${propertyId}.`);
+      }
+    } catch (err) {
+      console.error(`  ❌ Error fetching Companies for Property ${propertyId}:`, err.message);
     }
   }
 
@@ -403,6 +464,8 @@ async function processActivityForProperty(activityId, propertyId, activityType, 
     propertyId: String(propertyId),
     portfolioCount: portfolioIds.length,
     associationsCreated: totalAssociationsCreated,
+    companyCount: companyIds.length,
+    companyAssociationsCreated,
     durationMs: duration,
   };
 
@@ -467,7 +530,8 @@ async function pollPropertyAssociations() {
             // Process each activity
             for (const activityId of activityIds) {
               const result = await processActivityForProperty(activityId, propertyId, activityType, `poll-${Date.now()}`);
-              if (result.associationsCreated > 0) {
+              const associationCount = (result.associationsCreated || 0) + (result.companyAssociationsCreated || 0);
+              if (associationCount > 0) {
                 totalProcessed++;
               }
             }
@@ -480,7 +544,7 @@ async function pollPropertyAssociations() {
       }
     }
     
-    console.log(`✅ Polling complete: ${totalProcessed} activities cascaded to Portfolios\n`);
+    console.log(`✅ Polling complete: ${totalProcessed} activities updated with cascaded associations\n`);
     
   } catch (error) {
     console.error(`❌ Error in polling:`, error.message);
@@ -858,12 +922,15 @@ async function createBatchAssociations(activityType, toObjectType, associations,
   return 0;
 }
 
-async function processActivityBatch(activityType, activities, portfolioAssocType, dealAssocType) {
+async function processActivityBatch(activityType, activities, portfolioAssocType, dealAssocType, companyAssocType) {
   const activityIds = activities.map(a => a.id);
   
   const activityPropertyMap = await getBatchAssociations(activityType, activityIds, propertyObjectName);
   const activityPortfolioMap = await getBatchAssociations(activityType, activityIds, portfolioObjectName);
   const activityDealMap = await getBatchAssociations(activityType, activityIds, 'deals');
+  const activityCompanyMap = companyAssocType
+    ? await getBatchAssociations(activityType, activityIds, COMPANY_OBJECT_TYPE)
+    : null;
   
   const allPropertyIds = new Set();
   for (const propertyIds of activityPropertyMap.values()) {
@@ -880,9 +947,13 @@ async function processActivityBatch(activityType, activities, portfolioAssocType
     Array.from(allPropertyIds),
     'deals'
   );
+  const propertyCompanyMap = companyAssocType
+    ? await getBatchAssociations(propertyObjectName, Array.from(allPropertyIds), COMPANY_OBJECT_TYPE)
+    : null;
   
   const missingPortfolioAssociations = [];
   const missingDealAssociations = [];
+  const missingCompanyAssociations = [];
   
   for (const activity of activities) {
     const activityId = activity.id;
@@ -894,14 +965,21 @@ async function processActivityBatch(activityType, activities, portfolioAssocType
     const currentPortfolioSet = new Set(currentPortfolioIds);
     const currentDealIds = activityDealMap.get(activityId) || [];
     const currentDealSet = new Set(currentDealIds);
+    const currentCompanyIds = activityCompanyMap ? activityCompanyMap.get(activityId) || [] : [];
+    const currentCompanySet = new Set(currentCompanyIds);
     
     const expectedPortfolioIds = new Set();
     const expectedDealIds = new Set();
+    const expectedCompanyIds = new Set();
     for (const propertyId of propertyIds) {
       const portfolioIds = propertyPortfolioMap.get(propertyId) || [];
       portfolioIds.forEach(id => expectedPortfolioIds.add(id));
       const dealIds = propertyDealMap.get(propertyId) || [];
       dealIds.forEach(id => expectedDealIds.add(id));
+      if (propertyCompanyMap) {
+        const companyIds = propertyCompanyMap.get(propertyId) || [];
+        companyIds.forEach(id => expectedCompanyIds.add(id));
+      }
     }
     
     const missingPortfolioIds = Array.from(expectedPortfolioIds).filter(
@@ -910,12 +988,18 @@ async function processActivityBatch(activityType, activities, portfolioAssocType
     const missingDealIds = Array.from(expectedDealIds).filter(
       id => !currentDealSet.has(id)
     );
+    const missingCompanyIds = Array.from(expectedCompanyIds).filter(
+      id => !currentCompanySet.has(id)
+    );
     
     for (const portfolioId of missingPortfolioIds) {
       missingPortfolioAssociations.push({ fromId: activityId, toId: portfolioId });
     }
     for (const dealId of missingDealIds) {
       missingDealAssociations.push({ fromId: activityId, toId: dealId });
+    }
+    for (const companyId of missingCompanyIds) {
+      missingCompanyAssociations.push({ fromId: activityId, toId: companyId });
     }
   }
   
@@ -925,6 +1009,9 @@ async function processActivityBatch(activityType, activities, portfolioAssocType
   }
   if (missingDealAssociations.length > 0) {
     totalCreated += await createBatchAssociations(activityType, 'deals', missingDealAssociations, dealAssocType.typeId, dealAssocType.category);
+  }
+  if (companyAssocType && missingCompanyAssociations.length > 0) {
+    totalCreated += await createBatchAssociations(activityType, COMPANY_OBJECT_TYPE, missingCompanyAssociations, companyAssocType.typeId, companyAssocType.category);
   }
   
   return totalCreated;
@@ -961,13 +1048,21 @@ async function syncActivityPortfolioAssociations() {
       
       const portfolioAssocType = await getAssociationTypeId(activityType, portfolioObjectName);
       const dealAssocType = await getAssociationTypeId(activityType, 'deals');
+      let companyAssocType = null;
+      if (activityType === "notes") {
+        try {
+          companyAssocType = await getAssociationTypeId(activityType, COMPANY_OBJECT_TYPE);
+        } catch (error) {
+          console.error(`      ❌ notes → companies association lookup failed:`, error.message);
+        }
+      }
       let typeCreated = 0;
       
       for (let i = 0; i < allBatches.length; i += MAX_CONCURRENT_BATCHES) {
         const concurrentBatches = allBatches.slice(i, i + MAX_CONCURRENT_BATCHES);
         
         const results = await Promise.all(
-          concurrentBatches.map(batch => processActivityBatch(activityType, batch, portfolioAssocType, dealAssocType))
+          concurrentBatches.map(batch => processActivityBatch(activityType, batch, portfolioAssocType, dealAssocType, companyAssocType))
         );
         
         typeCreated += results.reduce((sum, r) => sum + r, 0);

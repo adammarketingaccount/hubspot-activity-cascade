@@ -7,7 +7,7 @@
 - Click "New Project"
 - Select "Deploy from GitHub repo"
 - Authorize Railway to access your repositories
-- Select: `Associate Deal Activities To Related Properties`
+- Select your repository (e.g., `hubspot-activity-cascade`)
 
 ### 2. Environment Variables to Set in Railway
 
