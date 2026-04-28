@@ -121,8 +121,9 @@ function verifyHubSpotSignature(req) {
     if (signatureV2) {
       const sourceString = HUBSPOT_WEBHOOK_SECRET + req.method + requestUri + rawBody;
       const hash = crypto.createHash("sha256").update(sourceString).digest("hex");
+      const legacyHash = crypto.createHash("sha256").update(HUBSPOT_WEBHOOK_SECRET + rawBody).digest("base64");
       
-      if (safeCompare(hash, signatureV2)) {
+      if (safeCompare(hash, signatureV2) || safeCompare(legacyHash, signatureV2)) {
         return true;
       }
     }
@@ -312,7 +313,7 @@ async function findRecentDealActivities(dealId, targetTimeMs) {
   }
 
   const lowerBoundMs = anchorTimeMs - LOOKBACK_MS;
-  const upperBoundMs = Math.max(Date.now() + ACTIVITY_LOOKAHEAD_MS, anchorTimeMs + ACTIVITY_LOOKAHEAD_MS);
+  const upperBoundMs = Date.now() + ACTIVITY_LOOKAHEAD_MS;
   const recentActivities = [];
   const seen = new Set();
 
