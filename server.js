@@ -91,6 +91,7 @@ function verifyHubSpotSignature(req) {
   }
 
   try {
+    const now = Date.now();
     const rawBody = req.rawBody ? req.rawBody.toString("utf8") : JSON.stringify(req.body || {});
     const requestUri = `${req.protocol}://${req.get("host")}${req.originalUrl}`;
 
@@ -99,7 +100,7 @@ function verifyHubSpotSignature(req) {
       const timestamp = Number(timestampV3);
       const fiveMinutesMs = 5 * 60 * 1000;
 
-      if (!Number.isFinite(timestamp) || Math.abs(Date.now() - timestamp) > fiveMinutesMs) {
+      if (!Number.isFinite(timestamp) || Math.abs(now - timestamp) > fiveMinutesMs) {
         console.error("❌ Invalid or stale HubSpot v3 request timestamp");
         return false;
       }
@@ -298,7 +299,7 @@ async function findRecentDealActivities(dealId, targetTimeMs) {
     try {
       anchorTimeMs = await safeGetDealLastActivityMs(dealId);
     } catch (error) {
-      console.error(`❌ Could not fetch hs_lastactivitydate for deal ${dealId}:`, error.message);
+      console.error("❌ Could not fetch hs_lastactivitydate for deal", String(dealId), error.message);
     }
   }
 
@@ -329,7 +330,7 @@ async function findRecentDealActivities(dealId, targetTimeMs) {
         }
       }
     } catch (error) {
-      console.error(`❌ Error finding recent ${activityType} for deal ${dealId}:`, error.message);
+      console.error("❌ Error finding recent activity associations for deal", String(dealId), activityType, error.message);
     }
   }
 
