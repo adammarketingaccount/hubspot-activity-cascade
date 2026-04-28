@@ -3,6 +3,7 @@ const axios = require("axios");
 const crypto = require("crypto");
 
 const app = express();
+app.set("trust proxy", true);
 
 // ===== CONFIGURATION =====
 const PORT = process.env.PORT || 3000;
@@ -16,6 +17,8 @@ const POLLING_LOOKBACK_MINUTES = parseInt(process.env.POLLING_LOOKBACK_MINUTES |
 const LOOKBACK_MS = parseInt(process.env.LOOKBACK_MS || "600000", 10); // 10 minutes default
 const MAX_ACTIVITY_IDS_PER_TYPE = parseInt(process.env.MAX_ACTIVITY_IDS_PER_TYPE || "50", 10);
 const NODE_ENV = process.env.NODE_ENV || "development";
+const SIGNATURE_MAX_AGE_MS = 5 * 60 * 1000;
+const ACTIVITY_LOOKAHEAD_MS = 60 * 1000;
 
 // Activity object type IDs (from HubSpot's expanded object support)
 const ACTIVITY_TYPE_IDS = {
@@ -54,7 +57,11 @@ const hs = axios.create({
 });
 
 // ===== MIDDLEWARE =====
-app.use(express.json());
+app.use(express.json({
+  verify: (req, res, buf) => {
+    req.rawBody = buf;
+  },
+}));
 
 // Request logging
 app.use((req, res, next) => {
@@ -73,6 +80,7 @@ function verifyHubSpotSignature(req) {
   const signatureV3 = req.headers["x-hubspot-signature-v3"];
   const signatureV2 = req.headers["x-hubspot-signature-v2"];
   const signatureV1 = req.headers["x-hubspot-signature"];
+  const timestampV3 = req.headers["x-hubspot-request-timestamp"];
   
   if (!signatureV3 && !signatureV2 && !signatureV1) {
     console.error("❌ Missing HubSpot signature header");
@@ -85,32 +93,49 @@ function verifyHubSpotSignature(req) {
   }
 
   try {
+    const now = Date.now();
+    const rawBody = req.rawBody ? req.rawBody.toString("utf8") : JSON.stringify(req.body || {});
+    if (!req.rawBody) {
+      console.warn("⚠️  Raw request body unavailable during signature verification; falling back to parsed JSON");
+    }
+    const requestUri = `${req.protocol}://${req.get("host")}${req.originalUrl}`;
+
     // Try v3 signature (newest format)
     if (signatureV3) {
-      const sourceString = HUBSPOT_WEBHOOK_SECRET + req.method + req.originalUrl + JSON.stringify(req.body);
-      const hash = crypto.createHash("sha256").update(sourceString).digest("base64");
+      const timestamp = Number(timestampV3);
+
+      if (!Number.isFinite(timestamp) || Math.abs(now - timestamp) > SIGNATURE_MAX_AGE_MS) {
+        console.error("❌ Invalid or stale HubSpot v3 request timestamp");
+        return false;
+      }
+
+      // HubSpot v3 signs the direct concatenation of method + URI + raw body + timestamp.
+      const sourceString = req.method + requestUri + rawBody + timestampV3;
+      const hash = crypto.createHmac("sha256", HUBSPOT_WEBHOOK_SECRET).update(sourceString).digest("base64");
       
-      if (hash === signatureV3) {
+      if (safeCompare(hash, signatureV3)) {
         return true;
       }
     }
     
     // Try v2 signature
     if (signatureV2) {
-      const sourceString = HUBSPOT_WEBHOOK_SECRET + JSON.stringify(req.body);
-      const hash = crypto.createHash("sha256").update(sourceString).digest("base64");
+      const sourceString = HUBSPOT_WEBHOOK_SECRET + req.method + requestUri + rawBody;
+      const hash = crypto.createHash("sha256").update(sourceString).digest("hex");
+      // Keep accepting the legacy implementation's format so existing deployments do not break during rollout.
+      const legacyHash = crypto.createHash("sha256").update(HUBSPOT_WEBHOOK_SECRET + rawBody).digest("base64");
       
-      if (hash === signatureV2) {
+      if (safeCompare(hash, signatureV2) || safeCompare(legacyHash, signatureV2)) {
         return true;
       }
     }
     
     // Try v1 signature (legacy)
     if (signatureV1) {
-      const sourceString = HUBSPOT_WEBHOOK_SECRET + JSON.stringify(req.body);
+      const sourceString = HUBSPOT_WEBHOOK_SECRET + rawBody;
       const hash = crypto.createHash("sha256").update(sourceString).digest("hex");
       
-      if (hash === signatureV1) {
+      if (safeCompare(hash, signatureV1)) {
         return true;
       }
     }
@@ -123,6 +148,17 @@ function verifyHubSpotSignature(req) {
     console.error("❌ Error verifying signature:", error.message);
     return false;
   }
+}
+
+function safeCompare(a, b) {
+  const aBuffer = Buffer.from(String(a));
+  const bBuffer = Buffer.from(String(b));
+
+  if (aBuffer.length !== bBuffer.length) {
+    return false;
+  }
+
+  return crypto.timingSafeEqual(aBuffer, bBuffer);
 }
 
 // ===== HELPER FUNCTIONS =====
@@ -250,6 +286,64 @@ const batchReadActivities = async (type, ids) => {
   return res.data?.results || [];
 };
 
+const getActivityTimestampMs = (activity) => {
+  const props = activity?.properties || {};
+  return (
+    parseHsDateMs(props.hs_timestamp) ||
+    parseHsDateMs(props.hs_createdate) ||
+    parseHsDateMs(props.hs_lastmodifieddate) ||
+    parseHsDateMs(activity?.createdAt) ||
+    parseHsDateMs(activity?.updatedAt)
+  );
+};
+
+const getActivityTypes = () => [...new Set(Object.values(ACTIVITY_TYPE_IDS))];
+
+async function findRecentDealActivities(dealId, targetTimeMs) {
+  let anchorTimeMs = parseHsDateMs(targetTimeMs);
+
+  if (!anchorTimeMs) {
+    try {
+      anchorTimeMs = await safeGetDealLastActivityMs(dealId);
+    } catch (error) {
+      console.error("❌ Could not fetch hs_lastactivitydate for deal", String(dealId), error.message);
+    }
+  }
+
+  if (!anchorTimeMs) {
+    anchorTimeMs = Date.now();
+  }
+
+  const lowerBoundMs = anchorTimeMs - LOOKBACK_MS;
+  const upperBoundMs = Date.now() + ACTIVITY_LOOKAHEAD_MS;
+  const recentActivities = [];
+  const seen = new Set();
+
+  for (const activityType of getActivityTypes()) {
+    try {
+      const activityIds = await listAssociatedIds("deals", dealId, activityType, MAX_ACTIVITY_IDS_PER_TYPE);
+      if (!activityIds.length) continue;
+
+      const activities = await batchReadActivities(activityType, activityIds);
+      for (const activity of activities) {
+        const activityId = String(activity.id);
+        const dedupeKey = `${activityType}:${activityId}`;
+        if (seen.has(dedupeKey)) continue;
+
+        const activityTimeMs = getActivityTimestampMs(activity);
+        if (activityTimeMs && activityTimeMs >= lowerBoundMs && activityTimeMs <= upperBoundMs) {
+          seen.add(dedupeKey);
+          recentActivities.push({ activityId, activityType, activityTimeMs });
+        }
+      }
+    } catch (error) {
+      console.error("❌ Error finding recent activity associations for deal", String(dealId), activityType, error.message);
+    }
+  }
+
+  return recentActivities;
+}
+
 const associateActivityToProperty = async (activityType, activityId, propertyType, propertyId, assocTypeId) => {
   const url =
     `/crm/v3/objects/${encodeURIComponent(activityType)}/${encodeURIComponent(activityId)}` +
@@ -338,6 +432,36 @@ async function processActivityForDeal(activityId, dealId, activityType, eventId)
   console.log(`✅ Completed in ${duration}ms:`, result);
   
   return result;
+}
+
+async function processDealLastActivityChange(event) {
+  const dealId = event.objectId;
+  const eventId = event.eventId;
+  const propertyValueTimeMs = parseHsDateMs(event.propertyValue);
+  const occurredAtTimeMs = parseHsDateMs(event.occurredAt);
+  const targetTimeMs = propertyValueTimeMs || occurredAtTimeMs;
+
+  if (!propertyValueTimeMs && occurredAtTimeMs) {
+    console.warn("⚠️  Invalid hs_lastactivitydate propertyValue; falling back to webhook occurredAt for deal", String(dealId));
+  }
+
+  console.log(`\n🔄 Processing deal last-activity change for deal: ${dealId} (event: ${eventId})`);
+
+  const recentActivities = await findRecentDealActivities(dealId, targetTimeMs);
+  console.log(`🔍 Found ${recentActivities.length} recent activities for deal ${dealId}`);
+
+  const activityResults = [];
+  for (const activity of recentActivities) {
+    const result = await processActivityForDeal(activity.activityId, dealId, activity.activityType, eventId);
+    activityResults.push(result);
+  }
+
+  return {
+    dealId: String(dealId),
+    eventId,
+    activitiesConsidered: recentActivities.length,
+    results: activityResults,
+  };
 }
 
 async function processActivityForProperty(activityId, propertyId, activityType, eventId) {
@@ -588,6 +712,7 @@ app.post("/webhook", async (req, res) => {
         eventId, 
         subscriptionId, 
         subscriptionType,
+        propertyName,
         fromObjectId,
         toObjectId,
         fromObjectTypeId,
@@ -598,8 +723,9 @@ app.post("/webhook", async (req, res) => {
       // Handle activity creation and association events
       const isActivityCreation = subscriptionType === "object.creation";
       const isActivityAssociation = subscriptionType === "object.associationChange";
+      const isDealLastActivityChange = propertyName === "hs_lastactivitydate" && Boolean(event.objectId);
 
-      if (!isActivityCreation && !isActivityAssociation) {
+      if (!isActivityCreation && !isActivityAssociation && !isDealLastActivityChange) {
         console.log(`⏭️  Skipping event: subscriptionType=${subscriptionType}`);
         // Log the full event for debugging non-object events
         if (subscriptionType && subscriptionType.includes('deal')) {
@@ -669,15 +795,18 @@ app.post("/webhook", async (req, res) => {
           console.log(`⏭️  Skipping: not activity-to-deal or activity-to-property association (${fromObjectTypeId} → ${toObjectTypeId})`);
           continue;
         }
+      } else if (isDealLastActivityChange) {
+        dealId = objectId;
+        console.log(`📌 Deal last-activity changed: Deal ${dealId} (${propertyName})`);
       }
 
-      if (!activityId) {
-        console.error("❌ Could not determine activity ID from event:", event);
+      if (!activityId && !dealId && !propertyId) {
+        console.error("❌ Could not determine target object from event:", event);
         continue;
       }
 
       // Deduplication: Skip if we've already processed this event
-      const dedupeKey = `${eventId || activityId}-${subscriptionId}-${dealId || propertyId || 'creation'}`;
+      const dedupeKey = `${eventId || activityId || objectId}-${subscriptionId}-${dealId || propertyId || 'creation'}`;
       if (processedEvents.has(dedupeKey)) {
         console.log(`⏭️  Skipping duplicate event: ${dedupeKey}`);
         continue;
@@ -702,9 +831,13 @@ app.post("/webhook", async (req, res) => {
           // Activity → Property: cascade to Portfolios
           const result = await processActivityForProperty(activityId, propertyId, activityType, eventId);
           results.push(result);
-        } else if (dealId) {
+        } else if (dealId && activityId) {
           // Activity → Deal: cascade to Properties
           const result = await processActivityForDeal(activityId, dealId, activityType, eventId);
+          results.push(result);
+        } else if (dealId && isDealLastActivityChange) {
+          // Deal property-change webhook: find recent Deal activities, then cascade them
+          const result = await processDealLastActivityChange(event);
           results.push(result);
         } else {
           // For creation events, check for both Deal and Property associations
