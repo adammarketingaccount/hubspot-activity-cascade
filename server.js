@@ -109,6 +109,7 @@ function verifyHubSpotSignature(req) {
         return false;
       }
 
+      // HubSpot v3 signs the direct concatenation of method + URI + raw body + timestamp.
       const sourceString = req.method + requestUri + rawBody + timestampV3;
       const hash = crypto.createHmac("sha256", HUBSPOT_WEBHOOK_SECRET).update(sourceString).digest("base64");
       
@@ -121,6 +122,7 @@ function verifyHubSpotSignature(req) {
     if (signatureV2) {
       const sourceString = HUBSPOT_WEBHOOK_SECRET + req.method + requestUri + rawBody;
       const hash = crypto.createHash("sha256").update(sourceString).digest("hex");
+      // Keep accepting the legacy implementation's format so existing deployments do not break during rollout.
       const legacyHash = crypto.createHash("sha256").update(HUBSPOT_WEBHOOK_SECRET + rawBody).digest("base64");
       
       if (safeCompare(hash, signatureV2) || safeCompare(legacyHash, signatureV2)) {
@@ -721,7 +723,7 @@ app.post("/webhook", async (req, res) => {
       // Handle activity creation and association events
       const isActivityCreation = subscriptionType === "object.creation";
       const isActivityAssociation = subscriptionType === "object.associationChange";
-      const isDealLastActivityChange = propertyName === "hs_lastactivitydate" && Boolean(objectId);
+      const isDealLastActivityChange = propertyName === "hs_lastactivitydate" && Boolean(event.objectId);
 
       if (!isActivityCreation && !isActivityAssociation && !isDealLastActivityChange) {
         console.log(`⏭️  Skipping event: subscriptionType=${subscriptionType}`);
