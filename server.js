@@ -17,6 +17,8 @@ const POLLING_LOOKBACK_MINUTES = parseInt(process.env.POLLING_LOOKBACK_MINUTES |
 const LOOKBACK_MS = parseInt(process.env.LOOKBACK_MS || "600000", 10); // 10 minutes default
 const MAX_ACTIVITY_IDS_PER_TYPE = parseInt(process.env.MAX_ACTIVITY_IDS_PER_TYPE || "50", 10);
 const NODE_ENV = process.env.NODE_ENV || "development";
+const SIGNATURE_MAX_AGE_MS = 5 * 60 * 1000;
+const ACTIVITY_LOOKAHEAD_MS = 60 * 1000;
 
 // Activity object type IDs (from HubSpot's expanded object support)
 const ACTIVITY_TYPE_IDS = {
@@ -57,7 +59,7 @@ const hs = axios.create({
 // ===== MIDDLEWARE =====
 app.use(express.json({
   verify: (req, res, buf) => {
-    req.rawBody = Buffer.from(buf);
+    req.rawBody = buf;
   },
 }));
 
@@ -93,14 +95,16 @@ function verifyHubSpotSignature(req) {
   try {
     const now = Date.now();
     const rawBody = req.rawBody ? req.rawBody.toString("utf8") : JSON.stringify(req.body || {});
+    if (!req.rawBody) {
+      console.warn("⚠️  Raw request body unavailable during signature verification; falling back to parsed JSON");
+    }
     const requestUri = `${req.protocol}://${req.get("host")}${req.originalUrl}`;
 
     // Try v3 signature (newest format)
     if (signatureV3) {
       const timestamp = Number(timestampV3);
-      const fiveMinutesMs = 5 * 60 * 1000;
 
-      if (!Number.isFinite(timestamp) || Math.abs(now - timestamp) > fiveMinutesMs) {
+      if (!Number.isFinite(timestamp) || Math.abs(now - timestamp) > SIGNATURE_MAX_AGE_MS) {
         console.error("❌ Invalid or stale HubSpot v3 request timestamp");
         return false;
       }
@@ -308,7 +312,7 @@ async function findRecentDealActivities(dealId, targetTimeMs) {
   }
 
   const lowerBoundMs = anchorTimeMs - LOOKBACK_MS;
-  const upperBoundMs = Math.max(Date.now() + 60000, anchorTimeMs + 60000);
+  const upperBoundMs = Math.max(Date.now() + ACTIVITY_LOOKAHEAD_MS, anchorTimeMs + ACTIVITY_LOOKAHEAD_MS);
   const recentActivities = [];
   const seen = new Set();
 
@@ -430,7 +434,13 @@ async function processActivityForDeal(activityId, dealId, activityType, eventId)
 async function processDealLastActivityChange(event) {
   const dealId = event.objectId;
   const eventId = event.eventId;
-  const targetTimeMs = parseHsDateMs(event.propertyValue) || parseHsDateMs(event.occurredAt);
+  const propertyValueTimeMs = parseHsDateMs(event.propertyValue);
+  const occurredAtTimeMs = parseHsDateMs(event.occurredAt);
+  const targetTimeMs = propertyValueTimeMs || occurredAtTimeMs;
+
+  if (!propertyValueTimeMs && occurredAtTimeMs) {
+    console.warn("⚠️  Invalid hs_lastactivitydate propertyValue; falling back to webhook occurredAt for deal", String(dealId));
+  }
 
   console.log(`\n🔄 Processing deal last-activity change for deal: ${dealId} (event: ${eventId})`);
 
